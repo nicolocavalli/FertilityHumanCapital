@@ -14,6 +14,50 @@ WAGE_XLS  = ROOT / "Age Group Table 6.5a Hourly pay - Gross 2012.xls"  # set to 
 POP_CSV   = ROOT / "population.csv"  # add this file to the repo
 
 # -------------------- Helpers --------------------
+def read_ons_life_table(path, sheet=None):
+    """
+    Robust reader for ONS 'National life tables' .xlsx.
+    Finds the block starting at Age==0 and returns (ages, l_m, l_f).
+    Assumes 'l_x' (survivors out of 100,000) are in columns 4 (male) and 10 (female),
+    which is the usual ONS layout; adjust col indices if your file differs.
+    """
+    import pandas as pd
+    xls = pd.ExcelFile(path) if sheet is None else None
+    sheets = [sheet] if sheet is not None else xls.sheet_names
+
+    for sh in sheets:
+        df = pd.read_excel(path, sheet_name=sh, header=None)
+        col0 = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+        # find a row where col0==0 (age zero)
+        start_candidates = col0.index[(col0.fillna(-1).astype(int) == 0)]
+        for start in start_candidates:
+            block = df.iloc[start:start+120, :]  # up to 120 in case table is longer
+            ages = pd.to_numeric(block.iloc[:, 0], errors="coerce")
+            # require a clean run of 0..100
+            if ages.iloc[:101].isna().any():
+                continue
+            if not np.all(ages.iloc[:101].astype(int).to_numpy() == np.arange(0,101)):
+                continue
+            # got it
+            ages = ages.iloc[:101].astype(int).to_numpy()
+            l_m = pd.to_numeric(block.iloc[:101, 3], errors="coerce").to_numpy()  # male l_x
+            l_f = pd.to_numeric(block.iloc[:101, 9], errors="coerce").to_numpy()  # female l_x
+            return ages, l_m, l_f, sh
+
+    # Fallback: try to coerce all numeric and search any contiguous 0..100 run
+    df = pd.read_excel(path, sheet_name=0, header=None)
+    col0 = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+    for i in range(0, max(0, len(df)-101)):
+        run = col0.iloc[i:i+101]
+        if run.isna().any():
+            continue
+        if np.all(run.astype(int).to_numpy() == np.arange(0,101)):
+            ages = run.astype(int).to_numpy()
+            l_m = pd.to_numeric(df.iloc[i:i+101, 3], errors="coerce").to_numpy()
+            l_f = pd.to_numeric(df.iloc[i:i+101, 9], errors="coerce").to_numpy()
+            return ages, l_m, l_f, 0
+    raise ValueError("Could not locate an Age 0..100 block in the life table workbook.")
+
 def hp_trend(x, lamb=100.0):
     s = pd.Series(np.asarray(x, dtype=float))
     cycle, trend = sm_hpfilter(s, lamb=lamb)
@@ -91,13 +135,11 @@ if missing:
 
 # --- Load local data ---
 # Life table: use the same slice as your MATLAB (A8:L108)
-life_raw = pd.read_excel(LIFE_XLSX, sheet_name=0, header=None)
-block = life_raw.iloc[7:108, :12].to_numpy()
-nlt_age = block[:, 0].astype(int)
-l_m = block[:, 3]   # male 'l_x' (survivors out of 100k)
-l_f = block[:, 9]   # female 'l_x'
+# Robust life-table read: auto-detect the Age 0..100 block (skips any prose rows)
+nlt_age, l_m, l_f, sheet_used = read_ons_life_table(LIFE_XLSX, sheet=None)
 S_male   = np.concatenate([l_m/100000.0, np.zeros(10)])
 S_female = np.concatenate([l_f/100000.0, np.zeros(10)])
+st.caption(f"Life table read from sheet: {sheet_used}")
 
 # NTA (use your real column names)
 Q = pd.read_excel(NTA_XLSX)
