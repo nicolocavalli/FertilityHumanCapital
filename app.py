@@ -218,9 +218,3 @@ if scen == "Fertility (TFR)":
     st.info(f"Approximate **annual** ΔBirths = {delta_births:,.0f}; Baseline annual births ≈ {births_base:,.0f}. "
             f"Immediate stock effect: ΔBirths × V(0) = £{(delta_births*V0):,.0f}. "
             "Add a cohort propagation later to see flows over time.")
-
-
-def aggregate_values(N_age, v, V, which='flow'):
-    N = np.asarray(N_age, float)
-    T = min(len(N), len(v), len(V))
-    return float(np.nansum(N[:T]()
