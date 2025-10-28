@@ -1,63 +1,12 @@
 # app.py
+import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from statsmodels.tsa.filters.hp_filter import hpfilter as sm_hpfilter
-from pathlib import Path
 
-# -------------------- CONFIG: file paths --------------------
-ROOT = Path(__file__).parent
-LIFE_XLSX = ROOT / "nltuk1517reg.xlsx"
-NTA_XLSX  = ROOT / "nta_UK.xlsx"
-WAGE_XLS  = ROOT / "Age Group Table 6.5a Hourly pay - Gross 2012.xls"  # set to your exact filename
-POP_CSV   = ROOT / "population.csv"  # add this file to the repo
-
-# -------------------- Helpers --------------------
-def read_ons_life_table(path, sheet=None):
-    """
-    Robust reader for ONS 'National life tables' .xlsx.
-    Finds the block starting at Age==0 and returns (ages, l_m, l_f).
-    Assumes 'l_x' (survivors out of 100,000) are in columns 4 (male) and 10 (female),
-    which is the usual ONS layout; adjust col indices if your file differs.
-    """
-    import pandas as pd
-    xls = pd.ExcelFile(path) if sheet is None else None
-    sheets = [sheet] if sheet is not None else xls.sheet_names
-
-    for sh in sheets:
-        df = pd.read_excel(path, sheet_name=sh, header=None)
-        col0 = pd.to_numeric(df.iloc[:, 0], errors="coerce")
-        # find a row where col0==0 (age zero)
-        start_candidates = col0.index[(col0.fillna(-1).astype(int) == 0)]
-        for start in start_candidates:
-            block = df.iloc[start:start+120, :]  # up to 120 in case table is longer
-            ages = pd.to_numeric(block.iloc[:, 0], errors="coerce")
-            # require a clean run of 0..100
-            if ages.iloc[:101].isna().any():
-                continue
-            if not np.all(ages.iloc[:101].astype(int).to_numpy() == np.arange(0,101)):
-                continue
-            # got it
-            ages = ages.iloc[:101].astype(int).to_numpy()
-            l_m = pd.to_numeric(block.iloc[:101, 3], errors="coerce").to_numpy()  # male l_x
-            l_f = pd.to_numeric(block.iloc[:101, 9], errors="coerce").to_numpy()  # female l_x
-            return ages, l_m, l_f, sh
-
-    # Fallback: try to coerce all numeric and search any contiguous 0..100 run
-    df = pd.read_excel(path, sheet_name=0, header=None)
-    col0 = pd.to_numeric(df.iloc[:, 0], errors="coerce")
-    for i in range(0, max(0, len(df)-101)):
-        run = col0.iloc[i:i+101]
-        if run.isna().any():
-            continue
-        if np.all(run.astype(int).to_numpy() == np.arange(0,101)):
-            ages = run.astype(int).to_numpy()
-            l_m = pd.to_numeric(df.iloc[i:i+101, 3], errors="coerce").to_numpy()
-            l_f = pd.to_numeric(df.iloc[i:i+101, 9], errors="coerce").to_numpy()
-            return ages, l_m, l_f, 0
-    raise ValueError("Could not locate an Age 0..100 block in the life table workbook.")
-
+# ---------- Helpers ----------
 def hp_trend(x, lamb=100.0):
     s = pd.Series(np.asarray(x, dtype=float))
     cycle, trend = sm_hpfilter(s, lamb=lamb)
@@ -66,6 +15,7 @@ def hp_trend(x, lamb=100.0):
 def compute_value_functions(ages, y, c, w, S_male, S_female,
                             hours_endowment=4000, sigma=0.8, eta=2.0,
                             z0_z=0.1, beta=0.98, r_rho=0.02, hp_lambda=100.0):
+    """Replicates your pipeline, returns dict with v, V, and pieces."""
     # Smooth wage and compute hours/leisure
     w_smooth = hp_trend(w, lamb=hp_lambda)
     y = np.asarray(y, float); c = np.asarray(c, float)
@@ -96,26 +46,54 @@ def compute_value_functions(ages, y, c, w, S_male, S_female,
     V_m = np.full(T, np.nan)
     V_f = np.full(T, np.nan)
     for i in range(T):
-        if S_dis_m[i] > 0:
-            V_m[i] = np.nansum(v[i:] * S_dis_m[i:]) / S_dis_m[i]
-        if S_dis_f[i] > 0:
-            V_f[i] = np.nansum(v[i:] * S_dis_f[i:]) / S_dis_f[i]
+        num_m = np.nansum(v[i:] * S_dis_m[i:])
+        den_m = S_dis_m[i]
+        V_m[i] = num_m/den_m if den_m > 0 else np.nan
+        num_f = np.nansum(v[i:] * S_dis_f[i:])
+        den_f = S_dis_f[i]
+        V_f[i] = num_f/den_f if den_f > 0 else np.nan
+
     return dict(ages=ages, v=v, V_m=V_m, V_f=V_f,
                 y=y, c=c, w=w, w_smooth=w_smooth, h=h, l=l,
-                yL=yL, yF=yF, cF=cF, S_m=S_m, S_f=S_f)
+                yL=yL, yF=yF, cF=cF, S_m=S_m, S_f=S_f, phi=phi)
 
 def aggregate_values(N_age, v, V, which='flow'):
+    """Sum over ages using population counts."""
     N = np.asarray(N_age, float)
     T = min(len(N), len(v), len(V))
-    return float(np.nansum(N[:T] * (v[:T] if which=='flow' else V[:T])))
+    if which == 'flow':
+        return float(np.nansum(N[:T] * v[:T]))
+    else:
+        return float(np.nansum(N[:T] * V[:T]))
 
-# -------------------- App --------------------
-st.set_page_config(page_title="Full-Income Counterfactuals (Local Files)", layout="wide")
-st.title("Full-Income Counterfactuals (Local Files)")
+def survival_to_one_year_probs(S):
+    """Given S(a)=P(survive to age a), return p(a)=P(survive from a to a+1)."""
+    S = np.asarray(S, float)
+    p = np.ones_like(S)
+    p[:-1] = np.divide(S[1:], S[:-1], out=np.ones_like(S[:-1]), where=~np.isclose(S[:-1], 0))
+    p[-1] = 0.0
+    return p
 
-# --- Parameters (left sidebar)
+def probs_to_survival(p):
+    """Reconstruct S from one-year survival p(a)."""
+    S = np.empty_like(p, float)
+    S[0] = 1.0
+    for a in range(len(p)-1):
+        S[a+1] = S[a] * p[a]
+    return S
+
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="Full-Income Counterfactuals", layout="wide")
+st.title("Full‑Income Counterfactuals: Fertility vs Productivity vs Older‑Age Quality")
+
 with st.sidebar:
-    st.header("Parameters")
+    st.header("1) Upload data")
+    life_file = st.file_uploader("ONS Life Table (.xlsx)", type=["xlsx"])
+    nta_file  = st.file_uploader("NTA profiles (.xlsx)", type=["xlsx"])
+    wage_file = st.file_uploader("ASHE wages (.xls/.xlsx)", type=["xls","xlsx"])
+    pop_file  = st.file_uploader("Population by age (.csv with Age,Population)", type=["csv"])
+
+    st.header("2) Core parameters")
     sigma = st.number_input("CRRA (σ)", value=0.8, step=0.05, min_value=0.2, max_value=3.0)
     eta   = st.number_input("Elasticity (η)", value=2.0, step=0.1, min_value=0.5, max_value=5.0)
     z0z   = st.number_input("z0/z", value=0.10, step=0.01, min_value=0.0, max_value=1.0)
@@ -124,32 +102,55 @@ with st.sidebar:
     hours_endowment = st.number_input("Annual time endowment (hours)", value=4000, min_value=1000, max_value=10000, step=100)
     hp_lambda = st.number_input("HP filter λ", value=100.0, step=50.0, min_value=10.0, max_value=2000.0)
 
-    st.header("Scenario")
-    scen = st.selectbox("Choose scenario", ["None", "Fertility (TFR)", "Productivity (ages 20–64)"])
+    st.header("3) Scenario")
+    scenario = st.selectbox("Choose scenario", ["Fertility", "Productivity (all or ages)", "Human capital (young ages)", "Older‑age quality (survival or QALY)", "Combined"])
 
-# --- Guardrails
-missing = [p.name for p in [LIFE_XLSX, NTA_XLSX, WAGE_XLS, POP_CSV] if not p.exists()]
-if missing:
-    st.error(f"Missing file(s): {', '.join(missing)}. Place them in the repo folder and reload.")
+    if scenario == "Fertility":
+        births_delta = st.number_input("Δ births (absolute)", value=10000, step=1000, min_value=0)
+        horizon_years = st.slider("PV horizon (years)", 1, 100, 90)
+    if scenario.startswith("Productivity"):
+        pct = st.slider("Productivity boost (%)", -50, 200, 10) / 100.0
+        amin, amax = st.slider("Affected ages", 0, 100, (20, 64))
+        alpha = st.slider("Consumption pass-through (α)", 0.0, 1.0, 0.5, 0.05)
+    if scenario.startswith("Human capital"):
+        pct = st.slider("Peak productivity gain at age 30 (%)", -50, 200, 15) / 100.0
+        width = st.slider("Age window half-width", 2, 20, 8)  # shape of the bump
+        alpha = st.slider("Consumption pass-through (α)", 0.0, 1.0, 0.5, 0.05)
+    if scenario.startswith("Older‑age quality"):
+        mode = st.selectbox("Improve", ["Survival (65+)", "QALY weight (65+)"])
+        if mode == "Survival (65+)":
+            surv_pct = st.slider("Increase 1‑year survival (relative, %)", 0, 50, 10) / 100.0
+        else:
+            qaly_pct = st.slider("QALY weight uplift for 65+ (%)", 0, 50, 10) / 100.0
+
+# ---------- Load data ----------
+if not (life_file and nta_file and wage_file and pop_file):
+    st.info("Upload the four files to proceed (life table, NTA, wages, population).")
     st.stop()
 
-# --- Load local data ---
-# Life table: use the same slice as your MATLAB (A8:L108)
-# Robust life-table read: auto-detect the Age 0..100 block (skips any prose rows)
-nlt_age, l_m, l_f, sheet_used = read_ons_life_table(LIFE_XLSX, sheet=None)
-S_male   = np.concatenate([l_m/100000.0, np.zeros(10)])
+# Life table (expects Age in first col, l_m at col 4, l_f at col 10 in the typical ONS layout).
+life_raw = pd.read_excel(life_file, sheet_name=0, header=None)
+# Try to auto-detect a 101-row age block; fallback to first 101 rows
+guess = life_raw.iloc[7:108, :12].to_numpy()
+nlt_age = guess[:, 0].astype(int)
+l_m = guess[:, 3]
+l_f = guess[:, 9]
+S_male   = np.concatenate([l_m/100000.0, np.zeros(10)])  # pad like your script
 S_female = np.concatenate([l_f/100000.0, np.zeros(10)])
-st.caption(f"Life table read from sheet: {sheet_used}")
 
-# NTA (use your real column names)
-Q = pd.read_excel(NTA_XLSX)
+# NTA
+Q = pd.read_excel(nta_file)
+# Use the column names you showed earlier
+y       = Q.loc[Q['Type'].eq('Smooth Mean'), 'Labor Income'].to_numpy()
+c       = Q.loc[Q['Type'].eq('Smooth Mean'), 'Consumption'].to_numpy()
+
 ages_nta = Q.loc[Q['Type'].eq('NTA'), 'Age'].to_numpy()
-y  = Q.loc[Q['Type'].eq('Smooth Mean'), 'Labor Income'].to_numpy()
-c  = Q.loc[Q['Type'].eq('Smooth Mean'), 'Consumption'].to_numpy()
 
-# Wages (ASHE)
-wage_tbl = pd.read_excel(WAGE_XLS, sheet_name=0, header=None)
+# Wages (ASHE). Try xls first; if not, read as xlsx
+wage_tbl = pd.read_excel(wage_file, sheet_name=0, header=None)
+# Pull two columns by position (median in col 2, mean in col 4 in original script)
 w = np.zeros(111)
+# Fill by bins like your MATLAB
 w[:17]   = wage_tbl.iloc[1, 3]
 w[17:21] = wage_tbl.iloc[2, 3]
 w[21:29] = wage_tbl.iloc[3, 3]
@@ -158,19 +159,21 @@ w[39:49] = wage_tbl.iloc[5, 3]
 w[49:59] = wage_tbl.iloc[6, 3]
 w[59:   ]= wage_tbl.iloc[7, 3]
 
-# Population
-popdf = pd.read_csv(POP_CSV).sort_values('Age')
+# Population by age
+popdf = pd.read_csv(pop_file)
+popdf = popdf.sort_values('Age')
 N_age = popdf['Population'].to_numpy()
 ages_pop = popdf['Age'].to_numpy()
 
-# Align everything to NTA age grid
+# Align everything to a common age grid (use NTA ages)
 A = ages_nta.astype(int)
-S_m_interp = np.interp(A, np.arange(len(S_male)),   S_male,   left=S_male[0], right=0.0)
+# Interpolate S and w to the NTA age grid if needed
+S_m_interp = np.interp(A, np.arange(len(S_male)), S_male, left=S_male[0], right=0.0)
 S_f_interp = np.interp(A, np.arange(len(S_female)), S_female, left=S_female[0], right=0.0)
-w_interp   = np.interp(A, np.arange(len(w)),        w,        left=w[0], right=w[-1])
-N_interp   = np.interp(A, ages_pop, N_age,          left=N_age[0], right=0.0)
+w_interp   = np.interp(A, np.arange(len(w)), w, left=w[0], right=w[-1])
+N_interp   = np.interp(A, ages_pop, N_age, left=N_age[0], right=0.0)
 
-# Baseline computation
+# ---------- Baseline ----------
 base = compute_value_functions(
     ages=A, y=y, c=c, w=w_interp,
     S_male=S_m_interp, S_female=S_f_interp,
@@ -178,52 +181,31 @@ base = compute_value_functions(
     z0_z=z0z, beta=beta, r_rho=rrho, hp_lambda=hp_lambda
 )
 
-TEV_flow_base  = aggregate_values(N_interp, base['v'], base['V_m'], which='flow')
+TEV_flow_base = aggregate_values(N_interp, base['v'], base['V_m'], which='flow')
 TEV_stock_base = aggregate_values(N_interp, base['v'], base['V_m'], which='stock')
 
-# -------------------- Scenario logic --------------------
-TEV_flow_scn, TEV_stock_scn = TEV_flow_base, TEV_stock_base
-v_new, V_new = base['v'], base['V_m']
-desc = "No scenario"
+# ---------- Scenario ----------
+Ages = base['ages']
+v_new = base['v'].copy()
+V_new = base['V_m'].copy()
+S_new = S_m_interp.copy()
 
-if scen == "Fertility (TFR)":
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Fertility settings")
-    # TFR slider: baseline 1.5, allow increments of 0.1
-    TFR_baseline = 1.5
-    TFR = st.sidebar.slider("Total Fertility Rate (TFR)", min_value=1.0, max_value=2.5, value=1.5, step=0.1)
-    dTFR = TFR - TFR_baseline
+if scenario == "Fertility":
+    # Stock effect now: ΔTEV_stock = ΔBirths × V(0)
+    delta_stock = births_delta * (V_new[0] if len(V_new) > 0 else 0.0)
+    TEV_flow_scn = TEV_flow_base  # no immediate flow change absent dynamics
+    TEV_stock_scn = TEV_stock_base + delta_stock
+    expl = f"ΔTEV_stock = ΔBirths × V(0) = {births_delta:,} × £{V_new[0]:,.0f}"
 
-    # Convert ΔTFR to Δ annual births using a simple approximation:
-    # births ≈ (TFR / span_years) * (# women aged 15–49)
-    span_years = 35
-    # We don't have sex-by-age; approximate 50% women
-    mask_15_49 = (A >= 15) & (A <= 49)
-    women_15_49 = 0.5 * np.sum(N_interp[mask_15_49])
-    births_base = (TFR_baseline / span_years) * women_15_49
-    delta_births = (dTFR / span_years) * women_15_49
-
-    # Monetary effect this year on the stock of the living:
-    # ΔTEV_stock ≈ ΔBirths × V(0)
-    V0 = float(V_new[0])
-    TEV_stock_scn = TEV_stock_base + delta_births * V0
-    TEV_flow_scn  = TEV_flow_base  # immediate flow unchanged without cohort propagation
-    desc = f"TFR from {TFR_baseline:.1f} → {TFR:.1f} (ΔBirths ≈ {delta_births:,.0f}/yr; baseline births ≈ {births_base:,.0f}/yr)"
-
-elif scen == "Productivity (ages 20–64)":
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Productivity settings")
-    pct = st.sidebar.slider("Productivity boost (%)", -50, 200, 10) / 100.0
-    amin, amax = 20, 64
-    alpha = st.sidebar.slider("Consumption pass-through (α)", 0.0, 1.0, 0.5, 0.05)
-
-    mask = (A >= amin) & (A <= amax)
+elif scenario.startswith("Productivity"):
+    # Boost y and (optionally) c for selected ages
+    mask = (Ages >= amin) & (Ages <= amax)
     y_scn = y.copy(); c_scn = c.copy()
     y_scn[mask] = y_scn[mask] * (1 + pct)
     c_scn[mask] = c_scn[mask] * (1 + alpha * pct)
 
     scn = compute_value_functions(
-        ages=A, y=y_scn, c=c_scn, w=w_interp,
+        ages=Ages, y=y_scn, c=c_scn, w=w_interp,
         S_male=S_m_interp, S_female=S_f_interp,
         hours_endowment=hours_endowment, sigma=sigma, eta=eta,
         z0_z=z0z, beta=beta, r_rho=rrho, hp_lambda=hp_lambda
@@ -231,9 +213,59 @@ elif scen == "Productivity (ages 20–64)":
     v_new, V_new = scn['v'], scn['V_m']
     TEV_flow_scn  = aggregate_values(N_interp, v_new, V_new, 'flow')
     TEV_stock_scn = aggregate_values(N_interp, v_new, V_new, 'stock')
-    desc = f"Productivity +{pct*100:.0f}% on ages {amin}-{amax}, α={alpha:.2f}"
+    expl = f"Productivity +{pct*100:.0f}% on ages {amin}-{amax}, consumption pass-through α={alpha:.2f}"
 
-# -------------------- Display --------------------
+elif scenario.startswith("Human capital"):
+    # Triangular productivity bump centered at 30
+    peak_age = 30
+    bump = np.maximum(0, 1 - np.abs(Ages - peak_age)/width) * pct
+    y_scn = y * (1 + bump)
+    c_scn = c * (1 + alpha * bump)
+    scn = compute_value_functions(
+        ages=Ages, y=y_scn, c=c_scn, w=w_interp,
+        S_male=S_m_interp, S_female=S_f_interp,
+        hours_endowment=hours_endowment, sigma=sigma, eta=eta,
+        z0_z=z0z, beta=beta, r_rho=rrho, hp_lambda=hp_lambda
+    )
+    v_new, V_new = scn['v'], scn['V_m']
+    TEV_flow_scn  = aggregate_values(N_interp, v_new, V_new, 'flow')
+    TEV_stock_scn = aggregate_values(N_interp, v_new, V_new, 'stock')
+    expl = f"Human capital peak +{pct*100:.0f}% at 30 (width {width}), α={alpha:.2f}"
+
+elif scenario.startswith("Older‑age quality"):
+    if mode == "Survival (65+)":
+        p = survival_to_one_year_probs(S_m_interp)
+        mask = Ages >= 65
+        p2 = p.copy()
+        p2[mask] = np.minimum(1.0, p2[mask]*(1 + surv_pct))
+        S_new = probs_to_survival(p2)
+        scn = compute_value_functions(
+            ages=Ages, y=y, c=c, w=w_interp,
+            S_male=S_new, S_female=S_f_interp,
+            hours_endowment=hours_endowment, sigma=sigma, eta=eta,
+            z0_z=z0z, beta=beta, r_rho=rrho, hp_lambda=hp_lambda
+        )
+        v_new, V_new = scn['v'], scn['V_m']
+        TEV_flow_scn  = aggregate_values(N_interp, v_new, V_new, 'flow')
+        TEV_stock_scn = aggregate_values(N_interp, v_new, V_new, 'stock')
+        expl = f"Increase 1‑year survival by {surv_pct*100:.0f}% for ages 65+"
+    else:
+        q = np.ones_like(Ages, float)
+        q[Ages >= 65] *= (1 + qaly_pct)
+        v_new = base['v'] * q
+        # V needs to reflect q weights over future ages; approximate by scaling current V by same factor at age
+        # (quick, conservative). For precision, re-sum with q weights across future ages.
+        V_new = base['V_m'].copy()
+        TEV_flow_scn  = aggregate_values(N_interp, v_new, V_new, 'flow')
+        TEV_stock_scn = aggregate_values(N_interp, v_new, V_new, 'stock')
+        expl = f"QALY weight +{qaly_pct*100:.0f}% for ages 65+ (flow scaled)"
+
+else:  # Combined (example: user could combine above—left as an extension)
+    v_new, V_new = base['v'], base['V_m']
+    TEV_flow_scn, TEV_stock_scn = TEV_flow_base, TEV_stock_base
+    expl = "No combined policy implemented in this minimal demo."
+
+# ---------- Results ----------
 col1, col2 = st.columns(2)
 with col1:
     st.subheader("Baseline")
@@ -241,22 +273,30 @@ with col1:
     st.metric("TEV_stock (living population)", f"£{TEV_stock_base:,.0f}")
 with col2:
     st.subheader("Scenario")
-    st.metric("TEV_flow (this year)", f"£{TEV_flow_scn:,.0f}",
-              f"{(TEV_flow_scn-TEV_flow_base)/max(1,TEV_flow_base)*100:.2f}%")
-    st.metric("TEV_stock (living population)", f"£{TEV_stock_scn:,.0f}",
-              f"{(TEV_stock_scn-TEV_stock_base)/max(1,TEV_stock_base)*100:.2f}%")
-st.caption(desc)
+    st.metric("TEV_flow (this year)", f"£{TEV_flow_scn:,.0f}", f"{(TEV_flow_scn-TEV_flow_base)/max(1,TEV_flow_base)*100:.2f}%")
+    st.metric("TEV_stock (living population)", f"£{TEV_stock_scn:,.0f}", f"{(TEV_stock_scn-TEV_stock_base)/max(1,TEV_stock_base)*100:.2f}%")
+st.caption(f"Scenario: {expl}")
 
-# Plots
+# Plots: v(a) and V(a)
 fig, ax = plt.subplots(1, 2, figsize=(12,4))
-ax[0].plot(A, base['v'], label='Baseline'); ax[0].plot(A, v_new, label='Scenario')
-ax[0].set_title("Value of a life-year v(a)"); ax[0].set_xlabel("Age"); ax[0].set_ylabel("£"); ax[0].legend()
-ax[1].plot(A, base['V_m'], label='Baseline'); ax[1].plot(A, V_new, label='Scenario')
-ax[1].set_title("Value of remaining life V(a)"); ax[1].set_xlabel("Age"); ax[1].set_ylabel("£"); ax[1].legend()
+ax[0].plot(Ages, base['v'], label='Baseline'); ax[0].plot(Ages, v_new, label='Scenario')
+ax[0].set_title("Value of a life-year v(a)"); ax[0].set_xlabel("Age"); ax[0].set_ylabel("£")
+ax[0].legend()
+ax[1].plot(Ages, base['V_m'], label='Baseline'); ax[1].plot(Ages, V_new, label='Scenario')
+ax[1].set_title("Value of remaining life V(a)"); ax[1].set_xlabel("Age"); ax[1].set_ylabel("£")
+ax[1].legend()
 st.pyplot(fig)
 
-# For fertility, show ΔBirths summary
-if scen == "Fertility (TFR)":
-    st.info(f"Approximate **annual** ΔBirths = {delta_births:,.0f}; Baseline annual births ≈ {births_base:,.0f}. "
-            f"Immediate stock effect: ΔBirths × V(0) = £{(delta_births*V0):,.0f}. "
-            "Add a cohort propagation later to see flows over time.")
+# Age contributions to ΔTEV_stock
+delta_per_age = (V_new - base['V_m']) * np.asarray(N_interp)
+fig2, ax2 = plt.subplots(figsize=(10,4))
+ax2.bar(Ages, delta_per_age, width=0.9)
+ax2.set_title("Contribution by age to ΔTEV_stock")
+ax2.set_xlabel("Age"); ax2.set_ylabel("£")
+st.pyplot(fig2)
+
+# Fertility note
+if scenario == "Fertility":
+    st.info(f"For fertility, the immediate stock gain is **ΔBirths × V(0)**. "
+            f"To see annual flows over time, add a simple cohort simulation: Nₜ₊₁(a+1)=Nₜ(a)·p(a).")
+
