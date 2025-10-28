@@ -1,0 +1,12 @@
+streamlit>=1.36
+numpy>=1.23
+pandas>=2.0
+matplotlib>=3.7
+statsmodels>=0.14
+
+# Excel readers:
+openpyxl>=3.1   # for .xlsx
+xlrd>=2.0.1     # for legacy .xls
+
+# optional but nice to have
+pyarrow>=15     # speeds up pandas IO; safe to omit if you want
