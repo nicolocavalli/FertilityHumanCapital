@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 LIFE_XLSX = ROOT / "nltuk1517reg.xlsx"
 NTA_XLSX  = ROOT / "nta_UK.xlsx"
-WAGE_XLS  = ROOT / "Age Group Table 6.5a  Hourly pay - Gross 2012.xls"  # set to your exact filename
+WAGE_XLS  = ROOT / "Age Group Table 6.5a Hourly pay - Gross 2012.xls"  # set to your exact filename
 POP_CSV   = ROOT / "population.csv"  # add this file to the repo
 
 # -------------------- Helpers --------------------
